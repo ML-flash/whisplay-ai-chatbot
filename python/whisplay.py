@@ -1,6 +1,44 @@
 import RPi.GPIO as GPIO
 import spidev
+import threading
 import time
+from datetime import timedelta
+
+import gpiod
+from gpiod.line import Bias, Direction, Edge, Value
+
+
+class _PinDimmer:
+    """Software PWM that only runs for in-between duty cycles.
+
+    None of the backlight/RGB pins support hardware PWM, and the software PWM
+    keeps a thread busy even at 0% or 100% duty. Those two cases are the
+    common ones (backlight fully on, LED off or a saturated color), so drive
+    the pin statically then and only start PWM for partial levels.
+    """
+
+    def __init__(self, pin, frequency):
+        self.pin = pin
+        self.pwm = GPIO.PWM(pin, frequency)
+        self.running = False
+
+    def set(self, duty):
+        duty = max(0.0, min(100.0, duty))
+        if duty in (0.0, 100.0):
+            if self.running:
+                self.pwm.stop()
+                self.running = False
+            GPIO.output(self.pin, GPIO.HIGH if duty == 100.0 else GPIO.LOW)
+        elif self.running:
+            self.pwm.ChangeDutyCycle(duty)
+        else:
+            self.pwm.start(duty)
+            self.running = True
+
+    def stop(self):
+        if self.running:
+            self.pwm.stop()
+            self.running = False
 
 
 class WhisplayBoard:
@@ -17,8 +55,11 @@ class WhisplayBoard:
     GREEN_PIN = 18
     BLUE_PIN = 16
 
-    # Button pin
+    # Button pin (BOARD 11 = BCM GPIO17 on gpiochip0); the line idles low and
+    # goes high while the button is held
     BUTTON_PIN = 11
+    BUTTON_CHIP = "/dev/gpiochip0"
+    BUTTON_GPIO = 17
 
     def __init__(self):
         GPIO.setmode(GPIO.BOARD)
@@ -27,33 +68,39 @@ class WhisplayBoard:
         # Initialize LCD pins
         GPIO.setup([self.DC_PIN, self.RST_PIN, self.LED_PIN], GPIO.OUT)
 
-        GPIO.output(self.LED_PIN, GPIO.LOW)  # Enable backlight
+        # Backlight is active low (duty 0 = full brightness); keep it off
+        # until the first frame is drawn
+        self.backlight_pwm = _PinDimmer(self.LED_PIN, 1000)
+        self.backlight_pwm.set(100)
 
-        # Initialize backlight PWM
-        self.backlight_pwm = GPIO.PWM(
-            self.LED_PIN, 1000
-        )  # 1000Hz PWM frequency is a reasonable starting point
-        self.backlight_pwm.start(100)
-
-        # Initialize RGB LED pins
+        # Initialize RGB LED pins (active low: duty 100 = off)
         GPIO.setup([self.RED_PIN, self.GREEN_PIN, self.BLUE_PIN], GPIO.OUT)
-        self.red_pwm = GPIO.PWM(self.RED_PIN, 100)
-        self.green_pwm = GPIO.PWM(self.GREEN_PIN, 100)
-        self.blue_pwm = GPIO.PWM(self.BLUE_PIN, 100)
+        self.red_pwm = _PinDimmer(self.RED_PIN, 100)
+        self.green_pwm = _PinDimmer(self.GREEN_PIN, 100)
+        self.blue_pwm = _PinDimmer(self.BLUE_PIN, 100)
         self._current_r = 0
         self._current_g = 0
         self._current_b = 0
-        self.red_pwm.start(0)
-        self.green_pwm.start(0)
-        self.blue_pwm.start(0)
+        self.set_rgb(0, 0, 0)
 
-        # Initialize button
-        GPIO.setup(self.BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        # Initialize button. RPi.GPIO/lgpio edge detection polls the line
+        # every ~1ms (~5% of a core); gpiod delivers kernel edge events to a
+        # thread that sleeps until the button actually changes.
         self.button_press_callback = None
         self.button_release_callback = None
-        GPIO.add_event_detect(
-            self.BUTTON_PIN, GPIO.BOTH, callback=self._button_event, bouncetime=50
+        self._button_request = gpiod.request_lines(
+            self.BUTTON_CHIP,
+            consumer="whisplay-button",
+            config={
+                self.BUTTON_GPIO: gpiod.LineSettings(
+                    direction=Direction.INPUT,
+                    bias=Bias.PULL_UP,
+                    edge_detection=Edge.BOTH,
+                    debounce_period=timedelta(milliseconds=50),
+                )
+            },
         )
+        threading.Thread(target=self._button_loop, daemon=True).start()
 
         # Initialize SPI
         self.spi = spidev.SpiDev()
@@ -71,8 +118,7 @@ class WhisplayBoard:
     # ========== Backlight Control ==========
     def set_backlight(self, brightness):
         if 0 <= brightness <= 100:
-            duty_cycle = 100 - brightness
-            self.backlight_pwm.ChangeDutyCycle(duty_cycle)
+            self.backlight_pwm.set(100 - brightness)
 
     def _reset_lcd(self):
         GPIO.output(self.RST_PIN, GPIO.HIGH)
@@ -202,9 +248,9 @@ class WhisplayBoard:
 
     # ========== RGB and Button Functions ==========
     def set_rgb(self, r, g, b):
-        self.red_pwm.ChangeDutyCycle(100 - (r / 255 * 100))
-        self.green_pwm.ChangeDutyCycle(100 - (g / 255 * 100))
-        self.blue_pwm.ChangeDutyCycle(100 - (b / 255 * 100))
+        self.red_pwm.set(100 - (r / 255 * 100))
+        self.green_pwm.set(100 - (g / 255 * 100))
+        self.blue_pwm.set(100 - (b / 255 * 100))
         self._current_r = r
         self._current_g = g
         self._current_b = b
@@ -229,7 +275,7 @@ class WhisplayBoard:
             time.sleep(delay_ms / 1000.0)
 
     def button_pressed(self):
-        return GPIO.input(self.BUTTON_PIN) == 0
+        return self._button_request.get_value(self.BUTTON_GPIO) == Value.ACTIVE
 
     def on_button_press(self, callback):
         self.button_press_callback = callback
@@ -245,17 +291,18 @@ class WhisplayBoard:
         if self.button_press_callback:
             self.button_press_callback()
 
-    def _button_event(self, channel):
-        if GPIO.input(channel):
-            # Falling edge (button pressed)
-            self._button_press_event(channel)
-
-        else:
-            # Rising edge (button released)
-            self._button_release_event(channel)
+    def _button_loop(self):
+        while True:
+            # blocks in the kernel until an edge arrives
+            for event in self._button_request.read_edge_events():
+                if event.event_type == event.Type.RISING_EDGE:
+                    self._button_press_event(self.BUTTON_PIN)
+                else:
+                    self._button_release_event(self.BUTTON_PIN)
 
     # ========== Cleanup ==========
     def cleanup(self):
+        self._button_request.release()
         self.spi.close()
         self.red_pwm.stop()
         self.green_pwm.stop()

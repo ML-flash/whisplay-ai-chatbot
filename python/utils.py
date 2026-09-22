@@ -215,16 +215,27 @@ class TextUtils:
 
   @staticmethod
   def wrap_text(draw, text, font, max_width):
+    """Wrap at the last space that fits; fall back to breaking between
+    characters for words wider than a line (and text without spaces)."""
     lines = []
     current_line = ""
     current_width = 0
     for char in text:
-      test_line = current_line + char
       char_width = TextUtils.get_char_size(font, char)[0]
-      current_width += char_width
-      w = current_width
-      if w <= max_width:
-        current_line = test_line
+      if current_width + char_width <= max_width or not current_line:
+        current_line += char
+        current_width += char_width
+      elif char == " ":
+        # the space itself becomes the line break
+        lines.append(current_line)
+        current_line = ""
+        current_width = 0
+      elif " " in current_line:
+        # move the partial word down to the next line
+        split_at = current_line.rindex(" ")
+        lines.append(current_line[:split_at])
+        current_line = current_line[split_at + 1:] + char
+        current_width = sum(TextUtils.get_char_size(font, c)[0] for c in current_line)
       else:
         lines.append(current_line)
         current_line = char
