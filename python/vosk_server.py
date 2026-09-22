@@ -29,6 +29,8 @@ def read_pcm(path):
                 wf.getframerate() == SAMPLE_RATE
                 and wf.getnchannels() == 1
                 and wf.getsampwidth() == 2
+                # a recorder killed mid-write leaves a zero-length header
+                and wf.getnframes() > 0
             ):
                 return wf.readframes(wf.getnframes())
     except (wave.Error, EOFError):

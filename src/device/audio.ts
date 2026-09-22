@@ -119,6 +119,24 @@ const recordAudioManually = (
     recordingProcessList.push(recordingProcess);
     stopFunc = () => {
       killAllRecordingProcesses();
+      // sox can miss the SIGINT when it lands while sox is still opening the
+      // capture device (a very quick press/release), and then records forever,
+      // leaving the flow stuck in "listening". Escalate until it exits; sox
+      // handles SIGTERM like SIGINT, so SIGKILL is the reliable last step.
+      const escalate = (signal: NodeJS.Signals, delayMs: number) =>
+        setTimeout(() => {
+          if (
+            recordingProcess.exitCode === null &&
+            recordingProcess.signalCode === null
+          ) {
+            console.log(
+              `Recording process ${recordingProcess.pid} still running, sending ${signal}`
+            );
+            recordingProcess.kill(signal);
+          }
+        }, delayMs);
+      escalate("SIGTERM", 1000);
+      escalate("SIGKILL", 2000);
     };
     recordingProcess.on("exit", () => {
       resolve(outputPath);
