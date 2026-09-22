@@ -9,11 +9,10 @@ import signal
 
 # from whisplay import WhisplayBoard
 from whisplay import WhisplayBoard
-from camera import CameraThread
 from utils import ColorUtils, ImageUtils, TextUtils
 
-scroll_thread = None
-scroll_stop_event = threading.Event()
+# set whenever display data changes; the render loop sleeps on it when idle
+render_event = threading.Event()
 
 status_font_size=24
 emoji_font_size=40
@@ -29,11 +28,6 @@ current_scroll_top = 0
 current_scroll_speed = 6
 current_image_path = ""
 current_image = None
-camera_mode = False
-camera_mode_button_press_time = 0
-camera_mode_button_release_time = 0
-camera_capture_image_path = ""
-camera_thread = None
 clients = {}
 
 class RenderThread(threading.Thread):
@@ -46,10 +40,15 @@ class RenderThread(threading.Thread):
         # Clear logo after 1 second and start running loop
         time.sleep(1)
         self.running = True
+        # load fonts once; reloading them every frame is a large CPU cost
         self.main_text_font = ImageFont.truetype(self.font_path, 20)
+        self.status_font = ImageFont.truetype(self.font_path, status_font_size)
+        self.emoji_font = ImageFont.truetype(self.font_path, emoji_font_size)
+        self.battery_font = ImageFont.truetype(self.font_path, battery_font_size)
         self.main_text_line_height = self.main_text_font.getmetrics()[0] + self.main_text_font.getmetrics()[1]
         self.text_cache_image = None
         self.current_render_text = ""
+        self.last_header_state = None
 
     def render_init_screen(self):
         # Display logo on startup
@@ -62,10 +61,10 @@ class RenderThread(threading.Thread):
             whisplay.draw_image(0, 0, whisplay.LCD_WIDTH, whisplay.LCD_HEIGHT, rgb565_data)
 
     def render_frame(self, status, emoji, text, scroll_top, battery_level, battery_color):
-        global current_scroll_speed, current_image_path, current_image, camera_mode
-        if camera_mode:
-            return  # Skip rendering if in camera mode
+        """Draw the current state; return True while text is still scrolling."""
+        global current_scroll_speed, current_image_path, current_image
         if current_image_path not in [None, ""]:
+            self.last_header_state = None
             # Try to load image from path
             if current_image is not None:
                 rgb565_data = ImageUtils.image_to_rgb565(current_image, self.whisplay.LCD_WIDTH, self.whisplay.LCD_HEIGHT)
@@ -93,39 +92,35 @@ class RenderThread(threading.Thread):
                     self.whisplay.draw_image(0, 0, self.whisplay.LCD_WIDTH, self.whisplay.LCD_HEIGHT, rgb565_data)
                 except Exception as e:
                     print(f"[Render] Failed to load image {current_image_path}: {e}")
+            return False
         else:
             current_image = None
             header_height = 88 + 10  # header + margin
-            # create a black background image for header
-            image = Image.new("RGBA", (self.whisplay.LCD_WIDTH, header_height), (0, 0, 0, 255))
-            draw = ImageDraw.Draw(image)
-            
-            clock_font_size = 24
-            # clock_font = ImageFont.truetype(self.font_path, clock_font_size)
 
-            # current_time = time.strftime("%H:%M:%S")
-            # draw.text((self.whisplay.LCD_WIDTH // 2, self.whisplay.LCD_HEIGHT // 2), current_time, font=clock_font, fill=(255, 255, 255, 255))
-            
-            # render header
-            self.render_header(image, draw, status, emoji, battery_level, battery_color)
-            self.whisplay.draw_image(0, 0, self.whisplay.LCD_WIDTH, header_height, ImageUtils.image_to_rgb565(image, self.whisplay.LCD_WIDTH, header_height))
+            # only redraw the header when its content changed (partial update)
+            header_state = (status, emoji, battery_level, battery_color)
+            if header_state != self.last_header_state:
+                self.last_header_state = header_state
+                image = Image.new("RGBA", (self.whisplay.LCD_WIDTH, header_height), (0, 0, 0, 255))
+                draw = ImageDraw.Draw(image)
+                self.render_header(image, draw, status, emoji, battery_level, battery_color)
+                self.whisplay.draw_image(0, 0, self.whisplay.LCD_WIDTH, header_height, ImageUtils.image_to_rgb565(image, self.whisplay.LCD_WIDTH, header_height))
 
             # render main text area
             text_area_height = self.whisplay.LCD_HEIGHT - header_height
             text_bg_image = Image.new("RGBA", (self.whisplay.LCD_WIDTH, text_area_height), (0, 0, 0, 255))
             text_draw = ImageDraw.Draw(text_bg_image)
-            self.render_main_text(text_bg_image, text_area_height, text_draw, text, current_scroll_speed)
+            scrolling = self.render_main_text(text_bg_image, text_area_height, text_draw, text, current_scroll_speed)
             self.whisplay.draw_image(0, header_height, self.whisplay.LCD_WIDTH, text_area_height, ImageUtils.image_to_rgb565(text_bg_image, self.whisplay.LCD_WIDTH, text_area_height))
-
-        
+            return scrolling
 
     def render_main_text(self, main_text_image, area_height, draw, text, scroll_speed=2):
+        """Render main text content, wrap lines according to screen width, only display currently visible part.
+        Return True if the text still has further to scroll."""
         global current_scroll_top
-        """Render main text content, wrap lines according to screen width, only display currently visible part"""
         if not text:
-            return
-        # Use main text font
-        font = ImageFont.truetype(self.font_path, 20)
+            return False
+        font = self.main_text_font
         lines = TextUtils.wrap_text(draw, text, font, self.whisplay.LCD_WIDTH - 20)
 
         # Line height
@@ -161,15 +156,16 @@ class RenderThread(threading.Thread):
         # Update scroll position
         if scroll_speed > 0 and current_scroll_top < (len(lines) + 1) * line_height - area_height:
             current_scroll_top += scroll_speed
-                
+            return True
+        return False
 
     def render_header(self, image, draw, status, emoji, battery_level, battery_color):
         global current_status, current_emoji, current_battery_level, current_battery_color
         global status_font_size, emoji_font_size, battery_font_size
-        
-        status_font = ImageFont.truetype(self.font_path, status_font_size)
-        emoji_font = ImageFont.truetype(self.font_path, emoji_font_size)
-        battery_font = ImageFont.truetype(self.font_path, battery_font_size)
+
+        status_font = self.status_font
+        emoji_font = self.emoji_font
+        battery_font = self.battery_font
 
         image_width = self.whisplay.LCD_WIDTH
 
@@ -250,10 +246,19 @@ class RenderThread(threading.Thread):
         draw.text((text_x, text_y), battery_text, font=battery_font, fill=text_fill_color)
 
     def run(self):
+        # redraw only when data changed or text is scrolling; the LCD keeps
+        # showing the last frame on its own, so an idle screen costs no CPU
         frame_interval = 1 / self.fps
+        scrolling = False
+        render_event.set()
         while self.running:
-            self.render_frame(current_status, current_emoji, current_text, current_scroll_top, current_battery_level, current_battery_color)
-            time.sleep(frame_interval)
+            # the timeout only lets stop() take effect; it does not redraw
+            if not scrolling and not render_event.wait(timeout=1.0):
+                continue
+            render_event.clear()
+            scrolling = self.render_frame(current_status, current_emoji, current_text, current_scroll_top, current_battery_level, current_battery_color)
+            if scrolling:
+                time.sleep(frame_interval)
             
     def stop(self):
         self.running = False
@@ -275,6 +280,7 @@ def update_display_data(status=None, emoji=None, text=None,
     current_battery_level = battery_level if battery_level is not None else current_battery_level
     current_battery_color = battery_color if battery_color is not None else current_battery_color
     current_image_path = image_path if image_path is not None else current_image_path
+    render_event.set()
 
 
 def send_to_all_clients(message):
@@ -292,58 +298,19 @@ def send_to_all_clients(message):
         except Exception as e:
             print(f"[Server] Failed to send notification to client {addr}: {e}")
 
-def exit_camera_mode():
-    global camera_mode, camera_thread
-    print("[Camera] Exiting camera mode...")
-    if camera_thread is not None:
-        camera_thread.stop()
-        camera_thread = None
-    notification = {"event": "exit_camera_mode"}
-    send_to_all_clients(notification)
-    camera_mode = False
-
-def check_is_released():
-    global camera_mode, camera_mode_button_press_time, camera_mode_button_release_time, camera_thread
-    if camera_mode and camera_mode_button_release_time < camera_mode_button_press_time:
-        # long press detected, exit camera mode
-        print("[Camera] Exiting camera mode due to long press...")
-        exit_camera_mode()
-
 def on_button_pressed():
-    global camera_mode, camera_mode_button_press_time, camera_mode_button_release_time
-    if camera_mode:
-        camera_mode_button_press_time = time.time()
-        # check after 2 seconds, exit camera mode if not released
-        threading.Timer(2.0, check_is_released).start()
-        return
     """Function executed when button is pressed"""
     print("[Server] Button pressed")
     notification = {"event": "button_pressed"}
     send_to_all_clients(notification)
 
 def on_button_release():
-    global camera_mode, camera_mode_button_press_time, camera_mode_button_release_time
-    if camera_mode:
-        camera_mode_button_release_time = time.time()
-        # if single press and release within 2 seconds
-        if camera_mode_button_release_time - camera_mode_button_press_time <= 2:
-            # capture image
-            print("[Camera] Capturing image...")
-            if camera_thread is not None:
-                camera_thread.capture()
-                notification = {"event": "camera_capture"}
-                send_to_all_clients(notification)
-                # exit camera mode in 2 seconds after capture
-                threading.Timer(2.0, exit_camera_mode).start()
-                
-        return  # Ignore button presses in camera mode
     """Function executed when button is released"""
     print("[Server] Button released")
     notification = {"event": "button_released"}
     send_to_all_clients(notification)
 
 def handle_client(client_socket, addr, whisplay):
-    global camera_capture_image_path, camera_mode, camera_thread
     print(f"[Socket] Client {addr} connected")
     clients[addr] = client_socket
     try:
@@ -373,9 +340,7 @@ def handle_client(client_socket, addr, whisplay):
                     battery_level = content.get("battery_level", None)
                     battery_color = content.get("battery_color", None)
                     image_path = content.get("image", None)
-                    capture_image_path = content.get("capture_image_path", None)
-                    # boolean to enable camera mode
-                    set_camera_mode = content.get("camera_mode", None)
+                    # camera fields (camera_mode, capture_image_path) are ignored: no camera on this device
 
                     if rgbled:
                         rgb255_tuple = ColorUtils.get_rgb255_from_any(rgbled)
@@ -388,23 +353,7 @@ def handle_client(client_socket, addr, whisplay):
                         
                     if brightness:
                         whisplay.set_backlight(brightness)
-                        
-                    if capture_image_path is not None:
-                        camera_capture_image_path = capture_image_path
-                    
-                    if set_camera_mode is not None:
-                        if set_camera_mode:
-                            print("[Camera] Entering camera mode...")
-                            camera_mode = True
-                            camera_thread = CameraThread(whisplay, camera_capture_image_path)
-                            camera_thread.start()
-                        else:
-                            print("[Camera] Exiting camera mode...")
-                            if camera_thread is not None:
-                                camera_thread.stop()
-                                camera_thread = None
-                            camera_mode = False
-                        
+
                     if (text is not None) or (status is not None) or (emoji is not None) or \
                        (battery_level is not None) or (battery_color is not None) or \
                        (image_path is not None):

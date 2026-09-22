@@ -1,100 +1,80 @@
-import * as fs from "fs";
-import * as path from "path";
-import { getAudioDurationInSeconds } from "get-audio-duration";
 import { spawn } from "child_process";
+import fs from "fs";
 import dotenv from "dotenv";
-import { ttsDir } from "../../utils/dir";
-import { TTSResult } from "../../type";
 
 dotenv.config();
 
-const piperBinaryPath = process.env.PIPER_BINARY_PATH || "/home/pi/piper/piper"; // Default to tts-1
-const piperModelPath =
-  process.env.PIPER_MODEL_PATH || "/home/pi/piper/voices/en_US-amy-medium.onnx";
+// Get paths from .env
+const piperBinary = process.env.PIPER_BINARY_PATH;
+const piperModel = process.env.PIPER_MODEL_PATH;
 
-const piperTTS = async (
-  text: string
-): Promise<TTSResult> => {
+const streamAudio = (text: string): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const now = Date.now();
-    const tempWavFile = path.join(ttsDir, `piper_${now}.wav`);
-    const convertedWavFile = path.join(ttsDir, `piper_${now}_converted.wav`);
-    const piperProcess = spawn(piperBinaryPath, [
-      "--model",
-      piperModelPath,
-      "--sentence-silence",
-      "1",
-      "--output_file",
-      tempWavFile,
-    ]);
+    // 1. Validation
+    if (!piperBinary || !piperModel) {
+      console.error("Error: PIPER_BINARY_PATH or PIPER_MODEL_PATH not set in .env");
+      resolve();
+      return;
+    }
 
-    piperProcess.stdin.write(text);
-    piperProcess.stdin.end();
+    if (!fs.existsSync(piperBinary)) {
+      console.error(`Error: Piper binary not found at ${piperBinary}`);
+      resolve();
+      return;
+    }
 
-    piperProcess.on("close", async (code: number) => {
-      if (code !== 0) {
-        // reject(new Error(`Piper process exited with code ${code}`));
-        console.error(`Piper process exited with code ${code}`);
-        resolve({ duration: 0 });
-        return;
-      }
+    if (!fs.existsSync(piperModel)) {
+      console.error(`Error: Piper model not found at ${piperModel}`);
+      resolve();
+      return;
+    }
 
-      if (fs.existsSync(tempWavFile) === false) {
-        console.log("Piper output file not found:", tempWavFile);
-        resolve({ duration: 0 });
-        return;
-      }
+    try {
+      // 2. Spawn Processes
+      const piperProcess = spawn(piperBinary, [
+        "--model", piperModel,
+        "--output-raw"
+      ]);
 
-      try {
-        // get sample rate and channels of the generated wav file
-        const originalBuffer = fs.readFileSync(tempWavFile);
-        const header = originalBuffer.subarray(0, 44);
-        const originalSampleRate = header.readUInt32LE(24);
-        const originalChannels = header.readUInt16LE(22);
+      const aplayProcess = spawn("aplay", [
+        "-r", "22050",
+        "-f", "S16_LE",
+        "-t", "raw",
+        "-"
+      ]);
 
-        // use sox to convert wav to 24kHz, 16bit, stereo
-        await new Promise<void>((res, rej) => {
-            
-          const soxProcess = spawn("sox", [
-            "-v",
-            "0.9",
-            tempWavFile,
-            "-r",
-            originalSampleRate.toString(),
-            "-c",
-            originalChannels.toString(),
-            convertedWavFile,
-          ]);
+      // 3. Pipe Audio: Piper -> Aplay
+      piperProcess.stdout.pipe(aplayProcess.stdin);
 
-          soxProcess.on("close", (soxCode: number) => {
-            if (soxCode !== 0) {
-              console.error(`Sox process exited with code ${soxCode}`);
-              rej(new Error(`Sox process exited with code ${soxCode}`));
-            } else {
-              // Replace original file with converted file
-              fs.unlinkSync(tempWavFile);
-              res();
-            }
-          });
-        });
+      // 4. Send Text to Piper
+      piperProcess.stdin.write(text);
+      piperProcess.stdin.end();
 
-        const duration = (await getAudioDurationInSeconds(convertedWavFile)) * 1000;
-        // Clean up temp file
-        // fs.unlinkSync(convertedWavFile);
-        
-        resolve({ filePath: convertedWavFile, duration });
-      } catch (error) {
-        // reject(error);
-        console.log("Error processing Piper output:", `"${text}"`, error);
-        resolve({ duration: 0 });
-      }
-    });
+      // 5. Error Logging
+      piperProcess.stderr.on("data", (data) => {});
+      aplayProcess.stderr.on("data", (data) => {});
 
-    piperProcess.on("error", (error: any) => {
-      console.log("Piper process error:", `"${text}"`, error);
-      resolve({ duration: 0 });
-    });
+      // 6. Resolve when audio finishes
+      aplayProcess.on("close", (code) => {
+        resolve();
+      });
+
+      aplayProcess.on("error", (err) => {
+        console.error("APlay Error:", err);
+        resolve();
+      });
+
+      piperProcess.on("error", (err) => {
+        console.error("Piper Error:", err);
+        resolve();
+      });
+
+    } catch (error) {
+      console.error("Stream Error:", error);
+      resolve();
+    }
   });
 };
 
-export default piperTTS;
+// EXPORT FIX: Export the function directly
+export default streamAudio;

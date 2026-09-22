@@ -12,3 +12,6 @@ chatbot.log
 use_ollama
 use_npm
 package-lock.json
+python/emoji_png/
+piper_tts/
+.env.bak-*

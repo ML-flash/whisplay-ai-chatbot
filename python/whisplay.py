@@ -143,6 +143,10 @@ class WhisplayBoard:
 
     def _send_data(self, data):
         GPIO.output(self.DC_PIN, GPIO.HIGH)
+        if isinstance(data, (bytes, bytearray)):
+            # writebytes2 takes a buffer of any length and chunks it in C
+            self.spi.writebytes2(data)
+            return
         max_chunk = 4096
         for i in range(0, len(data), max_chunk):
             self.spi.writebytes(data[i : i + max_chunk])
@@ -187,12 +191,8 @@ class WhisplayBoard:
 
     def fill_screen(self, color):
         self.set_window(0, 0, self.LCD_WIDTH - 1, self.LCD_HEIGHT - 1)
-        buffer = []
-        high = (color >> 8) & 0xFF
-        low = color & 0xFF
-        for _ in range(self.LCD_WIDTH * self.LCD_HEIGHT):
-            buffer.extend([high, low])
-        self._send_data(buffer)
+        pixel = bytes([(color >> 8) & 0xFF, color & 0xFF])
+        self._send_data(pixel * (self.LCD_WIDTH * self.LCD_HEIGHT))
 
     def draw_image(self, x, y, width, height, pixel_data):
         if (x + width > self.LCD_WIDTH) or (y + height > self.LCD_HEIGHT):

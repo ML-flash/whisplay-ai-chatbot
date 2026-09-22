@@ -1,14 +1,11 @@
 import os
 import unicodedata
-from io import BytesIO
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import cairosvg
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-try:
-  import cv2 as cv
-except ImportError:
-  cv = None
+# numpy, cv2 and cairosvg are intentionally not imported: together they cost
+# ~50MB of RAM on a 512MB Pi. RGB565 packing uses Pillow lookup tables, and
+# emoji are served from pre-rendered PNGs (cairosvg is only loaded lazily for
+# an emoji that has no PNG yet).
 
 class ColorUtils:
   @staticmethod
@@ -67,41 +64,28 @@ class ColorUtils:
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
+# lookup tables splitting RGB888 into the two bytes of big-endian RGB565:
+# high = RRRRRGGG, low = GGGBBBBB (the bit fields never overlap, so add == or)
+_R_HI = [v & 0xF8 for v in range(256)]
+_G_HI = [v >> 5 for v in range(256)]
+_G_LO = [(v << 3) & 0xE0 for v in range(256)]
+_B_LO = [v >> 3 for v in range(256)]
+
 class ImageUtils:
   @staticmethod
-  def image_to_rgb565(image: Image.Image, width: int, height: int) -> list:
+  def image_to_rgb565(image: Image.Image, width: int, height: int) -> bytes:
     image = image.convert("RGB")
-    image.thumbnail((width, height), Image.LANCZOS)
-    bg = Image.new("RGB", (width, height), (0, 0, 0))
-    x = (width - image.width) // 2
-    y = (height - image.height) // 2
-    bg.paste(image, (x, y))
-    np_img = np.array(bg)
-    r = (np_img[:, :, 0] >> 3).astype(np.uint16)
-    g = (np_img[:, :, 1] >> 2).astype(np.uint16)
-    b = (np_img[:, :, 2] >> 3).astype(np.uint16)
-    rgb565 = (r << 11) | (g << 5) | b
-    high_byte = (rgb565 >> 8).astype(np.uint8)
-    low_byte = (rgb565 & 0xFF).astype(np.uint8)
-    interleaved = np.dstack((high_byte, low_byte)).flatten().tolist()
-    return interleaved
-  
-  @staticmethod
-  def convertCameraFrameToRGB565(frame: np.ndarray, width: int, height: int):
-    # Resize frame to fit the display
-    if cv is not None:
-      frame = cv.resize(frame, (width, height), interpolation=cv.INTER_NEAREST)
-    else:
-      pil_img = Image.fromarray(frame)
-      pil_img = pil_img.resize((width, height), Image.NEAREST)
-      frame = np.array(pil_img)
-    # Convert to RGB565
-    r = (frame[:, :, 0] >> 3).astype(np.uint16)  # 5 bit
-    g = (frame[:, :, 1] >> 2).astype(np.uint16)  # 6 bit
-    b = (frame[:, :, 2] >> 3).astype(np.uint16)  # 5 bit
-    rgb565_data = (r << 11) | (g << 5) | b
-    return rgb565_data.byteswap().tobytes()
-  
+    if image.size != (width, height):
+      image.thumbnail((width, height), Image.LANCZOS)
+      bg = Image.new("RGB", (width, height), (0, 0, 0))
+      bg.paste(image, ((width - image.width) // 2, (height - image.height) // 2))
+      image = bg
+    r, g, b = image.split()
+    high = ImageChops.add(r.point(_R_HI), g.point(_G_HI))
+    low = ImageChops.add(g.point(_G_LO), b.point(_B_LO))
+    # "LA" raw bytes interleave the two channels: high, low, high, low, ...
+    return Image.merge("LA", (high, low)).tobytes()
+
   @staticmethod
   def crop_center(image: Image.Image, target_width: int, target_height: int) -> Image.Image:
     width, height = image.size
@@ -118,19 +102,40 @@ class EmojiUtils:
     return '-'.join(f"{ord(c):x}" for c in char) + ".svg"
 
   @staticmethod
+  def render_svg_to_png(svg_path, png_path, size):
+    import cairosvg  # lazy: only needed for emoji without a pre-rendered PNG
+    os.makedirs(os.path.dirname(png_path), exist_ok=True)
+    cairosvg.svg2png(url=svg_path, write_to=png_path, output_width=size, output_height=size)
+
+  @staticmethod
   def get_local_emoji_svg_image(char, size):
     filename = EmojiUtils.emoji_to_filename(char)
-    path = os.path.join("emoji_svg", filename)
-    if not os.path.exists(path):
-      # print(f"[警告] 找不到 SVG 图标: {path}")
-      return None
+    png_path = os.path.join("emoji_png", str(size), filename[:-4] + ".png")
+    if not os.path.exists(png_path):
+      svg_path = os.path.join("emoji_svg", filename)
+      if not os.path.exists(svg_path):
+        return None
+      try:
+        EmojiUtils.render_svg_to_png(svg_path, png_path, size)
+      except Exception as e:
+        print(f"[Emoji] Failed to render {svg_path}: {e}")
+        return None
     try:
-      png_bytes = cairosvg.svg2png(url=path, output_width=size, output_height=size)
-      img = Image.open(BytesIO(png_bytes)).convert("RGBA")
-      return img
+      return Image.open(png_path).convert("RGBA")
     except Exception as e:
-      print(f"[错误] 渲染 SVG 出错: {e}")
+      print(f"[Emoji] Failed to load {png_path}: {e}")
       return None
+
+  @staticmethod
+  def prerender_all(sizes):
+    """Render every emoji SVG to PNG at the given sizes (run once, offline)."""
+    for name in sorted(os.listdir("emoji_svg")):
+      if not name.endswith(".svg"):
+        continue
+      for size in sizes:
+        png_path = os.path.join("emoji_png", str(size), name[:-4] + ".png")
+        if not os.path.exists(png_path):
+          EmojiUtils.render_svg_to_png(os.path.join("emoji_svg", name), png_path, size)
 
   @staticmethod
   def is_emoji(char):

@@ -24,9 +24,38 @@ if (asrServer === ASRServer.vosk) {
   checkVoskInstallation();
 }
 
+// persistent vosk server (python/vosk_server.py) keeps the model loaded,
+// avoiding the ~15s model load of vosk-transcriber on every request
+const voskServerURL = process.env.VOSK_SERVER_URL || "http://127.0.0.1:8804";
+
+const recognizeViaServer = async (
+  audioFilePath: string
+): Promise<string | null> => {
+  try {
+    const res = await fetch(`${voskServerURL}/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: audioFilePath }),
+    });
+    if (!res.ok) {
+      console.error(`vosk server returned ${res.status}: ${await res.text()}`);
+      return null;
+    }
+    const data = (await res.json()) as { text?: string };
+    return data.text ?? "";
+  } catch (err) {
+    console.error("vosk server unavailable, falling back to vosk-transcriber");
+    return null;
+  }
+};
+
 export const recognizeAudio = async (
   audioFilePath: string
 ): Promise<string> => {
+  const serverText = await recognizeViaServer(audioFilePath);
+  if (serverText !== null) {
+    return serverText;
+  }
   if (!isVoskInstall) {
     console.error("Vosk is not installed.");
     return "";

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Set working directory
-export NVM_DIR="/home/pi/.nvm"
+export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 
@@ -60,6 +60,22 @@ if [ "$serve_ollama" = true ]; then
   ollama serve &
 fi
 
+# start the persistent vosk server so the model is loaded only once
+asr_server=$(grep -E '^[[:space:]]*ASR_SERVER[[:space:]]*=' .env | tail -n1 | cut -d'=' -f2- | tr -d '[:space:]"'"'")
+vosk_pid=""
+if [ "$asr_server" = "vosk" ]; then
+  VOSK_MODEL_PATH=$(grep -E '^[[:space:]]*VOSK_MODEL_PATH[[:space:]]*=' .env | tail -n1 | cut -d'=' -f2- | tr -d '[:space:]"'"'")
+  export VOSK_MODEL_PATH
+  echo "Starting Vosk server..."
+  python3 python/vosk_server.py &
+  vosk_pid=$!
+  # wait for the model to load before accepting requests
+  for i in $(seq 1 60); do
+    curl -sf http://127.0.0.1:8804/health > /dev/null && break
+    sleep 1
+  done
+fi
+
 # if file use_npm exists and is true, use npm
 if [ -f "use_npm" ]; then
   use_npm=true
@@ -71,8 +87,10 @@ if [ "$use_npm" = true ]; then
   echo "Using npm to start the application..."
   SOUND_CARD_INDEX=$card_index npm start
 else
-  echo "Using yarn to start the application..."
-  SOUND_CARD_INDEX=$card_index yarn start
+  # run the compiled output directly: skipping the yarn wrapper and ts-node
+  # saves ~80MB of RAM, which matters on a 512MB Pi Zero 2 W
+  echo "Starting the application with node..."
+  SOUND_CARD_INDEX=$card_index node dist/index.js
 fi
 
 # After the service ends, perform cleanup
@@ -81,6 +99,11 @@ echo "Cleaning up after service..."
 if [ "$serve_ollama" = true ]; then
   echo "Stopping Ollama server..."
   pkill ollama
+fi
+
+if [ -n "$vosk_pid" ]; then
+  echo "Stopping Vosk server..."
+  kill $vosk_pid
 fi
 
 # Record end status
