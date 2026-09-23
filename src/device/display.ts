@@ -2,6 +2,7 @@ import { exec } from "child_process";
 import { resolve } from "path";
 import { Socket } from "net";
 import { getCurrentTimeTag } from "../utils";
+import { LineSplitter } from "../utils/lineSplitter";
 
 interface Status {
   status: string;
@@ -33,6 +34,7 @@ export class WhisplayDisplay {
   };
 
   private client = null as Socket | null;
+  private receivedLines = new LineSplitter();
   private screenAsleep = false;
   private buttonPressedCallback: () => void = () => {};
   private buttonReleasedCallback: () => void = () => {};
@@ -158,37 +160,11 @@ export class WhisplayDisplay {
         );
         resolve();
       });
+      this.receivedLines.reset();
       this.client.on("data", (data: Buffer) => {
-        const dataString = data.toString();
-        if (dataString.trim() === "OK") {
-          return;
-        }
-        console.log(
-          `[${getCurrentTimeTag()}] Received data from Whisplay hat:`,
-          dataString
-        );
-        try {
-          const json = JSON.parse(dataString);
-          if (json.event === "button_pressed") {
-            this.buttonPressTimeArray.push(Date.now());
-            this.startMonitoringDoubleClick();
-            if (!this.buttonDetectInterval) {
-              console.log('emit pressed')
-              this.buttonPressedCallback();
-            }
-          }
-          if (json.event === "button_released") {
-            this.buttonReleaseTimeArray.push(Date.now());
-            if (!this.buttonDetectInterval) {
-              console.log('emit released')
-              this.buttonReleasedCallback();
-            }
-          }
-          if (json.event === "camera_capture") {
-            this.onCameraCaptureCallback();
-          }
-        } catch {
-          console.error("Failed to parse JSON from data");
+        // one chunk may hold several messages, or part of one
+        for (const line of this.receivedLines.push(data.toString())) {
+          this.handleDisplayMessage(line);
         }
       });
       this.client.on("error", (err: any) => {
@@ -199,6 +175,45 @@ export class WhisplayDisplay {
         }
       });
     });
+  }
+
+  // One newline-terminated message from the display process: "OK" acks every
+  // update, "ERROR: ..." reports a failed one, anything else is an event.
+  private handleDisplayMessage(line: string): void {
+    if (line === "OK") {
+      return;
+    }
+    if (line.startsWith("ERROR")) {
+      console.error(`[${getCurrentTimeTag()}] Display error:`, line);
+      return;
+    }
+    console.log(
+      `[${getCurrentTimeTag()}] Received data from Whisplay hat:`,
+      line
+    );
+    try {
+      const json = JSON.parse(line);
+      if (json.event === "button_pressed") {
+        this.buttonPressTimeArray.push(Date.now());
+        this.startMonitoringDoubleClick();
+        if (!this.buttonDetectInterval) {
+          console.log('emit pressed')
+          this.buttonPressedCallback();
+        }
+      }
+      if (json.event === "button_released") {
+        this.buttonReleaseTimeArray.push(Date.now());
+        if (!this.buttonDetectInterval) {
+          console.log('emit released')
+          this.buttonReleasedCallback();
+        }
+      }
+      if (json.event === "camera_capture") {
+        this.onCameraCaptureCallback();
+      }
+    } catch {
+      console.error("Failed to parse JSON from display:", line);
+    }
   }
 
   onButtonPressed(callback: () => void): void {
