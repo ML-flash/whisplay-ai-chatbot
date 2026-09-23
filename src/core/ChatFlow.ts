@@ -12,6 +12,7 @@ import {
   display,
   getCurrentStatus,
   onCameraCapture,
+  setScreenAsleep,
 } from "../device/display";
 import {
   playAudioData,
@@ -30,8 +31,15 @@ import { StreamResponser } from "./StreamResponsor";
 import { cameraDir, recordingsDir } from "../utils/dir";
 import { getLatestDisplayImg, setLatestCapturedImg } from "../utils/image";
 
+// Seconds of idle before the screen turns off (0 = immediately, <0 = never).
+// The grace period leaves time to read the last answer.
+const parsedIdleTimeout = parseFloat(process.env.SCREEN_IDLE_TIMEOUT ?? "");
+const screenIdleTimeoutMs =
+  (Number.isNaN(parsedIdleTimeout) ? 10 : parsedIdleTimeout) * 1000;
+
 class ChatFlow {
   currentFlowName: string = "";
+  screenSleepTimer: NodeJS.Timeout | null = null;
   recordingsDir: string = "";
   currentRecordFilePath: string = "";
   asrText: string = "";
@@ -126,8 +134,26 @@ class ChatFlow {
       });
   };
 
+  // Screen is off while idle and on in every other state; the button press
+  // that leaves "sleep" is what wakes it.
+  updateScreenPower = (flowName: string): void => {
+    if (this.screenSleepTimer) {
+      clearTimeout(this.screenSleepTimer);
+      this.screenSleepTimer = null;
+    }
+    if (flowName !== "sleep") {
+      setScreenAsleep(false);
+    } else if (screenIdleTimeoutMs >= 0) {
+      this.screenSleepTimer = setTimeout(() => {
+        this.screenSleepTimer = null;
+        if (this.currentFlowName === "sleep") setScreenAsleep(true);
+      }, screenIdleTimeoutMs);
+    }
+  };
+
   setCurrentFlow = (flowName: string): void => {
     console.log(`[${getCurrentTimeTag()}] switch to:`, flowName);
+    this.updateScreenPower(flowName);
     switch (flowName) {
       case "sleep":
         this.currentFlowName = "sleep";

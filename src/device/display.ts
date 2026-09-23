@@ -33,6 +33,7 @@ export class WhisplayDisplay {
   };
 
   private client = null as Socket | null;
+  private screenAsleep = false;
   private buttonPressedCallback: () => void = () => {};
   private buttonReleasedCallback: () => void = () => {};
   private buttonDoubleClickCallback: (() => void) | null = null;
@@ -149,7 +150,12 @@ export class WhisplayDisplay {
       this.client = new Socket();
       this.client.connect(12345, "0.0.0.0", () => {
         console.log("Connected to local display socket");
-        this.sendToDisplay(JSON.stringify(this.currentStatus));
+        this.sendToDisplay(
+          JSON.stringify({
+            ...this.currentStatus,
+            brightness: this.screenAsleep ? 0 : this.currentStatus.brightness,
+          })
+        );
         resolve();
       });
       this.client.on("data", (data: Buffer) => {
@@ -226,6 +232,16 @@ export class WhisplayDisplay {
     return this.currentStatus;
   }
 
+  // Idle screen-off: turns the backlight off without touching the brightness
+  // setting, so waking restores whatever brightness the user chose.
+  setScreenAsleep(asleep: boolean): void {
+    if (this.screenAsleep === asleep) return;
+    this.screenAsleep = asleep;
+    this.sendToDisplay(
+      JSON.stringify({ brightness: asleep ? 0 : this.currentStatus.brightness })
+    );
+  }
+
   async display(newStatus: Partial<Status> = {}): Promise<void> {
     const {
       status,
@@ -257,8 +273,9 @@ export class WhisplayDisplay {
     this.currentStatus.image = image;
 
     const changedValuesObj = Object.fromEntries(changedValues);
-    // always send the current brightness (set by voice command, default 100)
-    changedValuesObj.brightness = brightness;
+    // always send the current brightness (set by voice command, default 100),
+    // or 0 while the screen is asleep
+    changedValuesObj.brightness = this.screenAsleep ? 0 : brightness;
     const data = JSON.stringify(changedValuesObj);
     if (isTextChanged) console.log("send data:", data);
     this.sendToDisplay(data);
@@ -271,6 +288,8 @@ const displayInstance = new WhisplayDisplay();
 export const display = displayInstance.display.bind(displayInstance);
 export const getCurrentStatus =
   displayInstance.getCurrentStatus.bind(displayInstance);
+export const setScreenAsleep =
+  displayInstance.setScreenAsleep.bind(displayInstance);
 export const onButtonPressed =
   displayInstance.onButtonPressed.bind(displayInstance);
 export const onButtonReleased =
