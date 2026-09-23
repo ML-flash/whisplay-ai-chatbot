@@ -105,7 +105,10 @@ class WhisplayBoard:
         # Initialize SPI
         self.spi = spidev.SpiDev()
         self.spi.open(0, 0)
-        self.spi.max_speed_hz = 100_000_000
+        # The ST7789 is rated for ~62.5MHz writes; the old 100MHz (400MHz core
+        # clock / 4) is out of spec and the likely cause of garbled text.
+        # 50MHz = core / 8 still sends a full frame in ~21ms.
+        self.spi.max_speed_hz = 50_000_000
         self.spi.mode = 0b00
 
         self.previous_frame = None

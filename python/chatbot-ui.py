@@ -13,6 +13,9 @@ from utils import ColorUtils, ImageUtils, TextUtils
 
 # set whenever display data changes; the render loop sleeps on it when idle
 render_event = threading.Event()
+# full-screen safety redraw interval (seconds) while the backlight is on
+REFRESH_INTERVAL = 2.0
+screen_on = True
 
 status_font_size=24
 emoji_font_size=40
@@ -246,15 +249,19 @@ class RenderThread(threading.Thread):
         draw.text((text_x, text_y), battery_text, font=battery_font, fill=text_fill_color)
 
     def run(self):
-        # redraw only when data changed or text is scrolling; the LCD keeps
-        # showing the last frame on its own, so an idle screen costs no CPU
+        # redraw when data changed or text is scrolling; the LCD keeps showing
+        # the last frame on its own. While the backlight is on, also redraw
+        # the full screen every REFRESH_INTERVAL seconds so a frame garbled in
+        # transfer does not stay on screen (the original code redrew at 30fps,
+        # which hid such glitches). With the backlight off it costs nothing.
         frame_interval = 1 / self.fps
         scrolling = False
         render_event.set()
         while self.running:
-            # the timeout only lets stop() take effect; it does not redraw
-            if not scrolling and not render_event.wait(timeout=1.0):
-                continue
+            if not scrolling and not render_event.wait(timeout=REFRESH_INTERVAL):
+                if not screen_on:
+                    continue
+                self.last_header_state = None  # force the header to redraw too
             render_event.clear()
             scrolling = self.render_frame(current_status, current_emoji, current_text, current_scroll_top, current_battery_level, current_battery_color)
             if scrolling:
@@ -311,6 +318,7 @@ def on_button_release():
     send_to_all_clients(notification)
 
 def handle_client(client_socket, addr, whisplay):
+    global screen_on
     print(f"[Socket] Client {addr} connected")
     clients[addr] = client_socket
     try:
@@ -352,6 +360,7 @@ def handle_client(client_socket, addr, whisplay):
                         battery_tuple = (0, 0, 0)
                         
                     if brightness is not None:  # 0 = screen off
+                        screen_on = brightness > 0
                         whisplay.set_backlight(brightness)
 
                     if (text is not None) or (status is not None) or (emoji is not None) or \
