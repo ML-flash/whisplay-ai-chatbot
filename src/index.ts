@@ -1,6 +1,7 @@
 import { display } from "./device/display";
 import Battery from "./device/battery";
 import ChatFlow from "./core/ChatFlow";
+import { applySavedSettings } from "./core/LocalCommands";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -18,3 +19,5 @@ battery.addListener("batteryLevel", (data: any) => {
 new ChatFlow({
   enableCamera: process.env.ENABLE_CAMERA === "true",
 });
+
+applySavedSettings();

@@ -13,7 +13,13 @@ import {
   getCurrentStatus,
   onCameraCapture,
 } from "../device/display";
-import { recordAudioManually, recordFileFormat } from "../device/audio";
+import {
+  playAudioData,
+  recordAudioManually,
+  recordFileFormat,
+  stopPlaying,
+} from "../device/audio";
+import { LocalCommand, matchLocalCommand, runLocalCommand } from "./LocalCommands";
 import {
   recognizeAudio,
   chatWithLLMStream,
@@ -91,6 +97,33 @@ class ChatFlow {
       });
     }
     this.partialThinking = remaining;
+  };
+
+  // Device commands (volume, brightness, screen) are handled on the Pi
+  // without the LLM; confirm on screen and by voice, then go back to sleep.
+  runCommand = (command: LocalCommand): void => {
+    console.log(`[${getCurrentTimeTag()}] local command:`, JSON.stringify(command));
+    this.currentFlowName = "command";
+    const reply = runLocalCommand(command);
+    display({
+      status: "done",
+      emoji: "👍",
+      text: reply,
+      RGB: "#00c8a3",
+    });
+    onButtonPressed(() => {
+      stopPlaying();
+      this.setCurrentFlow("listening");
+    });
+    onButtonReleased(noop);
+    ttsProcessor(reply)
+      .then((result) => playAudioData(result))
+      .catch((error) => console.error("Command reply playback error:", error))
+      .finally(() => {
+        if (this.currentFlowName === "command") {
+          this.setCurrentFlow("sleep");
+        }
+      });
   };
 
   setCurrentFlow = (flowName: string): void => {
@@ -184,7 +217,12 @@ class ChatFlow {
               console.log("Audio recognized result:", result);
               this.asrText = result;
               display({ status: "recognizing", text: result });
-              this.setCurrentFlow("answer");
+              const command = matchLocalCommand(result);
+              if (command) {
+                this.runCommand(command);
+              } else {
+                this.setCurrentFlow("answer");
+              }
             } else {
               this.setCurrentFlow("sleep");
             }

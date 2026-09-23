@@ -257,7 +257,8 @@ export class WhisplayDisplay {
     this.currentStatus.image = image;
 
     const changedValuesObj = Object.fromEntries(changedValues);
-    changedValuesObj.brightness = 100;
+    // always send the current brightness (set by voice command, default 100)
+    changedValuesObj.brightness = brightness;
     const data = JSON.stringify(changedValuesObj);
     if (isTextChanged) console.log("send data:", data);
     this.sendToDisplay(data);

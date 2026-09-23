@@ -351,7 +351,7 @@ def handle_client(client_socket, addr, whisplay):
                     else:
                         battery_tuple = (0, 0, 0)
                         
-                    if brightness:
+                    if brightness is not None:  # 0 = screen off
                         whisplay.set_backlight(brightness)
 
                     if (text is not None) or (status is not None) or (emoji is not None) or \
